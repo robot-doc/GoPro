@@ -1,0 +1,14 @@
+[Unit]
+Description=Connect GoPro HERO8 over BLE and Wi‑Fi
+After=network-online.target bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Path to your script
+ExecStart=/usr/local/bin/connect_gopro.sh
+# Ensure it only runs once and stays “active” after exit
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
