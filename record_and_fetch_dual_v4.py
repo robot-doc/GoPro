@@ -99,28 +99,125 @@ def check_storage_availability():
 # CONNECTION MANAGEMENT
 # ============================================================================
 
-def activate_gopro_wifi(gopro_id, retries=3):
-    """Activate GoPro Wi-Fi via BLE"""
+def is_gopro_wifi_already_on(gopro_id):
+    """Quick check if GoPro Wi-Fi is already broadcasting"""
+    config = GOPROS[gopro_id]
+    # Quick scan for the SSID
+    success, output, _ = run_cmd(f"sudo iwlist scan | grep -i '{config['ssid']}'", timeout=10)
+    return success and config['ssid'] in output
+
+def activate_gopro_wifi(gopro_id, max_attempts=5):
+    """Smart GoPro Wi-Fi activation with adaptive retry strategy"""
     config = GOPROS[gopro_id]
     print(f"Activating {config['name']} Wi-Fi via BLE...")
     
-    for attempt in range(retries):
-        print(f"BLE attempt {attempt+1}/{retries} for {config['name']}")
-        time.sleep(5 if attempt > 0 else 8)  # Wait longer on first attempt
+    # First check if Wi-Fi is already on
+    if is_gopro_wifi_already_on(gopro_id):
+        print(f"✓ {config['name']} Wi-Fi already broadcasting")
+        return True
+    
+    bluetooth_reset_count = 0
+    base_delay = 3
+    
+    for attempt in range(max_attempts):
+        print(f"BLE attempt {attempt+1}/{max_attempts} for {config['name']}")
         
+        # Exponential backoff with jitter (but cap at reasonable max)
+        if attempt > 0:
+            delay = min(base_delay * (1.5 ** attempt) + (attempt * 0.5), 15)
+            print(f"Waiting {delay:.1f}s before attempt...")
+            time.sleep(delay)
+        else:
+            time.sleep(8)  # Initial longer wait for BLE advertising
+        
+        # Try BLE command with adaptive timeout
+        timeout = 20 + (attempt * 5)  # Increase timeout on later attempts
         cmd = f"'{PYTHON_BIN}' '{BLE_TOOL}' --interactive true --address '{config['mac']}' --command 'wifi on'"
-        success, _, err = run_cmd(cmd, timeout=30)
+        success, stdout, stderr = run_cmd(cmd, timeout=timeout)
         
         if success:
-            print(f"BLE succeeded for {config['name']}")
-            return True
+            print(f"✓ BLE command succeeded for {config['name']}")
+            
+            # Verify Wi-Fi actually turned on (give it time to start)
+            print("Verifying Wi-Fi activation...")
+            for verify_attempt in range(3):
+                time.sleep(3)
+                if is_gopro_wifi_already_on(gopro_id):
+                    print(f"✓ {config['name']} Wi-Fi confirmed broadcasting")
+                    return True
+                print(f"Wi-Fi not yet broadcasting, checking again... ({verify_attempt+1}/3)")
+            
+            print(f"⚠ BLE succeeded but Wi-Fi not broadcasting for {config['name']}")
+            # Continue trying rather than giving up
         
-        if attempt < retries - 1:
-            print(f"BLE failed, resetting Bluetooth...")
-            run_cmd("sudo hciconfig hci0 down && sudo hciconfig hci0 up")
+        # Analyze failure and decide on recovery strategy
+        needs_bt_reset = False
+        
+        if "timeout" in stderr.lower() or "timed out" in stderr.lower():
+            print(f"BLE timeout - GoPro may be sleeping or out of range")
+            needs_bt_reset = attempt >= 2  # Reset BT after 2 timeouts
+        elif "connection refused" in stderr.lower() or "no route" in stderr.lower():
+            print(f"BLE connection refused - GoPro may not be in pairing mode")
+            needs_bt_reset = True
+        elif "device not found" in stderr.lower() or "not available" in stderr.lower():
+            print(f"BLE device not found - checking Bluetooth adapter")
+            needs_bt_reset = True
+        else:
+            print(f"BLE failed: {stderr[:100]}...")
+            needs_bt_reset = attempt >= 1  # Reset BT for unknown errors
+        
+        # Smart Bluetooth reset - only when likely to help
+        if needs_bt_reset and bluetooth_reset_count < 2 and attempt < max_attempts - 1:
+            print(f"Resetting Bluetooth adapter (reset #{bluetooth_reset_count + 1})")
+            if reset_bluetooth_smart():
+                bluetooth_reset_count += 1
+                time.sleep(2)  # Give BT time to stabilize
+            else:
+                print("Bluetooth reset failed - continuing without reset")
+        
+        # On last two attempts, try alternative approaches
+        if attempt >= max_attempts - 2:
+            print(f"Trying alternative BLE approach for {config['name']}...")
+            # Try without interactive mode
+            alt_cmd = f"'{PYTHON_BIN}' '{BLE_TOOL}' --address '{config['mac']}' --command 'wifi on'"
+            alt_success, _, _ = run_cmd(alt_cmd, timeout=timeout)
+            if alt_success:
+                time.sleep(5)
+                if is_gopro_wifi_already_on(gopro_id):
+                    print(f"✓ Alternative BLE method worked for {config['name']}")
+                    return True
     
-    print(f"All BLE attempts failed for {config['name']}")
+    print(f"✗ All BLE attempts failed for {config['name']} after {max_attempts} tries")
     return False
+
+def reset_bluetooth_smart():
+    """Smart Bluetooth reset with verification"""
+    print("Performing smart Bluetooth reset...")
+    
+    # Stop bluetooth service cleanly first
+    run_cmd("sudo systemctl stop bluetooth", timeout=10)
+    time.sleep(1)
+    
+    # Reset HCI device
+    success1, _, _ = run_cmd("sudo hciconfig hci0 down", timeout=5)
+    time.sleep(1)
+    success2, _, _ = run_cmd("sudo hciconfig hci0 up", timeout=5)
+    time.sleep(1)
+    
+    # Restart bluetooth service
+    success3, _, _ = run_cmd("sudo systemctl start bluetooth", timeout=10)
+    time.sleep(2)
+    
+    # Verify Bluetooth is working
+    success4, output, _ = run_cmd("hciconfig hci0", timeout=5)
+    bt_working = success4 and "UP RUNNING" in output
+    
+    if bt_working:
+        print("✓ Bluetooth reset successful")
+    else:
+        print("✗ Bluetooth reset may have failed")
+    
+    return bt_working
 
 def setup_wifi_interface(gopro_id):
     """Setup Wi-Fi interface for GoPro"""
@@ -212,29 +309,40 @@ def test_gopro_connection(gopro_id):
     return False
 
 def connect_single_gopro(gopro_id):
-    """Connect to a single GoPro"""
+    """Connect to a single GoPro with smart connection strategy"""
     config = GOPROS[gopro_id]
     print(f"\n=== Connecting {config['name']} ===")
     
     # Check interface exists
     success, _, _ = run_cmd(f"ip link show {config['interface']}")
     if not success:
-        print(f"Interface {config['interface']} not found")
+        print(f"✗ Interface {config['interface']} not found")
         return False
     
-    # Steps: BLE -> Wi-Fi setup -> Connect -> Test
+    # Quick check if already connected
+    if test_gopro_connection(gopro_id):
+        print(f"✓ {config['name']} already connected and working")
+        return True
+    
+    # Step 1: Activate GoPro Wi-Fi via BLE (smart retry logic)
     if not activate_gopro_wifi(gopro_id):
         return False
     
-    time.sleep(5)  # Wait for Wi-Fi to start
-    
+    # Step 2: Setup Wi-Fi interface 
+    print(f"Setting up Wi-Fi interface for {config['name']}...")
     wpa_conf = setup_wifi_interface(gopro_id)
     if not wpa_conf:
+        print(f"✗ Failed to setup Wi-Fi interface for {config['name']}")
         return False
     
+    # Step 3: Connect to Wi-Fi with verification
+    print(f"Connecting to {config['name']} Wi-Fi network...")
     if not connect_wifi(gopro_id, wpa_conf):
+        print(f"✗ Failed to connect to {config['name']} Wi-Fi")
         return False
     
+    # Step 4: Test HTTP connection with retry
+    print(f"Testing HTTP connection to {config['name']}...")
     return test_gopro_connection(gopro_id)
 
 def connect_all_gopros():
